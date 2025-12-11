@@ -1,0 +1,453 @@
+---
+title: "Final project"
+author: "Lwazi Majenge"
+date: "2025-11-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# 1. SETUP & PACKAGES
+```{r}
+#We start off by installing all the packages needed to run the code in this script.Next to each package is a brief explanation of its function
+
+library(tidyverse) #Data manipulation and ggplot
+library(lubridate) #Data handling
+library(TTR) #These are our technical indicators (RSI, MACD, SMA, etc.). Their purpose will be further explained later in ########[]########
+library(caret) #Machine Learning framework (for training and comparing models)
+library(corrplot) #Correlation plots in EDA
+library(randomForest) #Random Forest model
+library(gbm) #Gradient boosting model
+library(pROC)# Roc curves and AUC scoring
+
+# Neural network package: 
+#Keras will be used to define neural networks in R.
+#We also need a package that will run the neural network. 
+install.packages("reticulate")
+library(reticulate) #This package installs and manages the correct python version needed for the back-end.
+reticulate::install_python(version = "3.10.12")
+#The old "keras" package is deprecated. To work around this we simply install keras3
+install.packages("keras3")
+library(keras3) 
+
+
+set.seed(123)  # For reproducibility
+```
+
+# 2. LOAD DATA
+```{r}
+#The data used 
+data_path <- "S&P500 price data.csv"
+
+sp500_raw <- readr::read_csv(data_path)
+
+# Basic checks
+view (sp500_raw)
+glimpse(sp500_raw)
+summary(sp500_raw)
+
+# Ensure Date column is Date class and data is sorted
+sp500_raw <- sp500_raw %>%
+mutate(Date = as.Date(Date))
+
+sp500_raw <- sp500_raw %>% arrange(Date)
+
+```
+
+# 3. FEATURE ENGINEERING (TARGET + TECHNICAL INDICATORS)
+```{r}
+# 3.1 Create target: next-day direction (Up=1, Down=0)
+sp500 <- sp500_raw %>%
+  arrange(Date) %>%
+  mutate(
+    Close_lead = lead(Close), #this is tomorrow's close
+    direction = if_else(Close_lead > Close, 1L, 0L)
+  ) %>%
+  drop_na(direction)
+
+table(sp500$direction)
+mean(sp500$direction)  # proportion of "Up" days
+
+
+# 3.2 Create technical indicators (at least 10 features)
+# Using the TTR package; we’ll create typical indicators:
+
+sp500_fe <- sp500 %>%
+  mutate(
+    ret      = Close / lag(Close) - 1, # Daily return
+    rsi_14   = RSI(Close, n = 14), # RSI(14)
+    sma_10   = SMA(Close, n = 10), # SMA(10)
+    sma_50   = SMA(Close, n = 50), # SMA(50)
+    sma_200  = SMA(Close, n = 200), # SMA(200)
+    macd_val = MACD(Close, nFast = 12, nSlow = 26, nSig = 9)[, "macd"],# MACD
+    macd_sig = MACD(Close, nFast = 12, nSlow = 26, nSig = 9)[, "signal"],# Signal
+    bbands   = BBands(Close, n = 20, sd = 2)[, "pctB"],# Bollinger %B
+    vol_20   = runSD(ret, n = 20),# Rolling volatility
+    mom_10   = momentum(Close, n = 10) # Momentum
+  )
+
+# Stochastic oscillator needs High, Low, Close
+stoch_vals <- stoch(sp500_fe[, c("High", "Low", "Close")])
+sp500_fe$stoch_k <- stoch_vals[, "fastK"]
+sp500_fe$stoch_d <- stoch_vals[, "fastD"]
+
+# Remove rows with NA created by rolling calculations
+sp500_fe <- sp500_fe %>% drop_na()
+
+# There is no volume data for the years before 1950. Therefore remove all rows before 1950 for better quality of models.
+
+sp500_fe <- sp500_fe %>% 
+  filter(Volume > 0)
+
+# Keep final modelling data set: response + predictors
+sp500_model <- sp500_fe %>%
+  select(
+    direction,
+    ret, rsi_14, sma_10, sma_50, sma_200,
+    macd_val, macd_sig, bbands, vol_20, mom_10,
+    stoch_k, stoch_d, Volume
+  )
+
+glimpse(sp500_model)
+summary(sp500_model)
+
+```
+# 4. TRAIN–TEST SPLIT (TIME-AWARE)
+```{r}
+# Number of observations
+n <- nrow(sp500_model)
+
+# Use 70% of the earliest data for training, 30% of the latest data for testing
+train_prop <- 0.7
+train_end  <- floor(train_prop * n)
+
+train_idx <- 1:train_end
+test_idx  <- (train_end + 1):n
+
+train_data <- sp500_model[train_idx, ]
+test_data  <- sp500_model[test_idx, ]
+
+# Quick checks
+nrow(train_data)
+nrow(test_data)
+
+# Class balance in each split
+table(train_data$direction)
+prop.table(table(train_data$direction))
+
+table(test_data$direction)
+prop.table(table(test_data$direction))
+
+```
+
+# 5. PREPROCESSING (SCALING, FACTORS, ETC.)
+```{r}
+# caret prefers factor response for classification
+train_data$direction <- factor(train_data$direction, levels = c(0, 1), labels = c("Down", "Up"))
+test_data$direction  <- factor(test_data$direction,  levels = c(0, 1), labels = c("Down", "Up"))
+
+# Create a recipe for scaling/centering predictors
+library(recipes)
+
+rec <- recipe(direction ~ ., data = train_data) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+
+prep_rec  <- prep(rec)
+# Apply recipe to training and test sets
+train_x   <- bake(prep_rec, new_data = train_data)
+test_x    <- bake(prep_rec, new_data = test_data)
+
+# Check processed data
+glimpse(train_x)
+
+# Common trainControl for all models
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+```
+
+
+# 6. MODELS
+
+##6.1 Logistic Regression (GLM)
+```{r}
+set.seed(123)
+
+mod_glm <- train(
+  direction ~ .,           # use all other columns to predict direction
+  data      = train_x,
+  method    = "glm",
+  family    = binomial,    # logistic regression
+  trControl = ctrl,        # CV + class probs + ROC
+  metric    = "ROC"        # optimise AUC
+)
+
+mod_glm              # CV results
+summary(mod_glm$finalModel)   # GLM coefficients etc.
+
+#Predictions on the test set
+
+glm_probs <- predict(mod_glm, newdata = test_x, type = "prob")[, "Up"]  # P(Up)
+glm_pred  <- predict(mod_glm, newdata = test_x)                         # class labels
+
+# Confusion matrix
+cm_glm <- confusionMatrix(glm_pred, test_x$direction, positive = "Up")
+cm_glm
+
+# ROC curve and AUC
+roc_glm <- roc(
+  response  = test_x$direction,
+  predictor = glm_probs,
+  levels    = c("Down", "Up"),
+  direction = "<"
+)
+
+auc_glm <- auc(roc_glm)
+auc_glm
+
+plot(roc_glm, main = "GLM ROC Curve", print.auc = TRUE)
+```
+##6.2 Random Forest
+
+```{r}
+set.seed(123)
+
+mod_rf <- train(
+  direction ~ .,
+  data      = train_x,
+  method    = "rf",
+  trControl = ctrl,      # CV + ROC
+  tuneLength = 5,        # Try 5 different mtry values
+  metric    = "ROC"      # Optimise AUC during CV
+)
+
+mod_rf                     # CV results
+varImp(mod_rf) %>% plot(main = "Random Forest Variable Importance")
+
+#Predictions on test data
+
+rf_probs <- predict(mod_rf, newdata = test_x, type = "prob")[, "Up"]
+rf_pred  <- predict(mod_rf, newdata = test_x)
+
+# Confusion matrix
+cm_rf <- confusionMatrix(rf_pred, test_x$direction, positive = "Up")
+cm_rf
+
+# ROC and AUC
+roc_rf <- roc(
+  response  = test_x$direction,
+  predictor = rf_probs,
+  levels    = c("Down", "Up"),
+  direction = "<"
+)
+
+auc_rf <- auc(roc_rf)
+auc_rf
+
+plot(roc_rf, main = "Random Forest ROC Curve", print.auc = TRUE)
+
+# Variable importance
+rf_imp <- varImp(mod_rf)
+print(rf_imp)
+plot(rf_imp, main = "Random Forest Variable Importance")
+```
+
+## 6.3 Gradient Boosting Machine (GBM)
+```{r}
+set.seed(123)
+
+mod_gbm <- train(
+  direction ~ .,
+  data       = train_x,
+  method     = "gbm",
+  trControl  = ctrl,        # CV + ROC
+  verbose    = FALSE,
+  tuneLength = 5,           # try 5 combinations of depth/trees/shrinkage
+  metric     = "ROC"      # optimise AUC
+)
+
+mod_gbm     # CV results
+varImp(mod_gbm) %>% plot(main = "GBM Variable Importance")
+
+#Predictions on test data
+
+gbm_probs <- predict(mod_gbm, newdata = test_x, type = "prob")[, "Up"]
+gbm_pred  <- predict(mod_gbm, newdata = test_x)
+
+# Confusion Matrix
+cm_gbm <- confusionMatrix(gbm_pred, test_x$direction, positive = "Up")
+cm_gbm
+
+# ROC and AUC
+roc_gbm <- roc(
+  response  = test_x$direction,
+  predictor = gbm_probs,
+  levels    = c("Down", "Up"),
+  direction = "<"
+)
+
+auc_gbm <- auc(roc_gbm)
+auc_gbm
+
+plot(roc_gbm, main = "GBM ROC Curve", print.auc = TRUE)
+```
+
+## 6.4 Neural Network (Keras)
+
+```{r}
+library(keras3)
+# 1. Prepare matrices for keras3
+
+x_train_mat <- train_x %>%
+  dplyr::select(-direction) %>%
+  as.matrix()
+
+x_test_mat <- test_x %>%
+  dplyr::select(-direction) %>%
+  as.matrix()
+
+# Convert factor response to numeric 0/1
+y_train_vec <- ifelse(train_x$direction == "Up", 1, 0)
+y_test_vec  <- ifelse(test_x$direction == "Up", 1, 0)
+
+num_features <- ncol(x_train_mat)
+
+# 2. Define the model architecture
+
+dnn_model <- keras3::keras_model_sequential() |>
+  keras3::layer_dense(units = 32, activation = "relu", input_shape = num_features) |>
+  keras3::layer_dropout(rate = 0.3) |>
+  keras3::layer_dense(units = 16, activation = "relu") |>
+  keras3::layer_dropout(rate = 0.3) |>
+  keras3::layer_dense(units = 1, activation = "sigmoid")
+
+dnn_model |> summary()
+
+# 3. Compile the model 
+
+dnn_model |>
+  compile(
+    loss      = "binary_crossentropy",
+    optimizer = optimizer_adam(),
+    metrics   = "accuracy"
+  )
+
+# 4. Fit the model
+
+history <- dnn_model |>
+  fit(
+    x = x_train_mat,
+    y = y_train_vec,
+    validation_split = 0.2,
+    epochs = 50,
+    batch_size = 32,
+    verbose = 1
+  )
+
+plot(history)
+
+# 5. Evaluate on test set
+
+dnn_probs <- dnn_model |>
+  predict(x_test_mat) |>
+  as.vector()
+
+# Turn probabilities into class labels using 0.5 threshold
+dnn_pred <- ifelse(dnn_probs > 0.5, "Up", "Down") |>
+  factor(levels = c("Down", "Up"))
+
+# Confusion matrix
+cm_dnn <- confusionMatrix(dnn_pred, test_x$direction, positive = "Up")
+cm_dnn
+
+# ROC and AUC
+roc_dnn <- roc(
+  response  = test_x$direction,
+  predictor = dnn_probs,
+  levels    = c("Down", "Up"),
+  direction = "<"
+)
+
+auc_dnn <- auc(roc_dnn)
+auc_dnn
+
+plot(roc_dnn, main = "Neural Network ROC Curve", print.auc = TRUE)
+```
+
+# 7. COMPARISON SUMMARY
+```{r}
+results_tbl <- tibble::tibble(
+  Model     = c("Logistic Regression (GLM)",
+                "Random Forest",
+                "Gradient Boosting (GBM)",
+                "Neural Network (DNN)"),
+  
+  Accuracy  = c(
+    cm_glm$overall["Accuracy"],
+    cm_rf$overall["Accuracy"],
+    cm_gbm$overall["Accuracy"],
+    cm_dnn$overall["Accuracy"]
+  ),
+
+  Balanced_Accuracy = c(
+    cm_glm$byClass["Balanced Accuracy"],
+    cm_rf$byClass["Balanced Accuracy"],
+    cm_gbm$byClass["Balanced Accuracy"],
+    cm_dnn$byClass["Balanced Accuracy"]
+  ),
+
+  AUC = c(
+    auc_glm,
+    auc_rf,
+    auc_gbm,
+    auc_dnn
+  )
+)
+
+# Display the table
+results_tbl
+
+knitr::kable(
+  results_tbl,
+  digits = 4,
+  caption = "Model Performance Comparison (Test Set)"
+)
+
+print(results_tbl)
+
+# Neat graphic: compare models visually
+
+library(tidyverse)
+
+# 1. Convert to long format for ggplot
+results_long <- results_tbl |>
+  pivot_longer(
+    cols = c(Accuracy, Balanced_Accuracy, AUC),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# 2. Make a grouped bar chart
+ggplot(results_long, aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = "dodge") +
+  coord_cartesian(ylim = c(0.48, 0.56)) +  # zoom into the interesting range
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title = "Model Performance Comparison (Test Set)",
+    x = "Model",
+    y = "Score",
+    fill = "Metric"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+```
